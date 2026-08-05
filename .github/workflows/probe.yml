@@ -1,0 +1,55 @@
+name: probe
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      simulate:
+        description: "'test-alert' = gửi tin TEST đánh dấu rõ, chứng minh đường alert"
+        required: false
+        default: ''
+permissions:
+  actions: read
+concurrency: probe
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: probe + alert on transition
+        env:
+          TG_BOT: ${{ secrets.TG_BOT }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          GH_TOKEN: ${{ github.token }}
+          SIMULATE: ${{ inputs.simulate }}
+          TARGET: https://status.phongnguyen.dev
+        run: |
+          set -u
+          ts() { date -u +'%d-%m %H:%M:%SZ'; }
+          send() {
+            curl -sS --max-time 15 -o /dev/null --fail \
+              "https://api.telegram.org/bot${TG_BOT}/sendMessage" \
+              -d chat_id="${TG_CHAT}" --data-urlencode text="$1"
+          }
+          if [ "$SIMULATE" = "test-alert" ]; then
+            send "🧪 [TEST] [$(ts)] external prober (GitHub Actions) alive — đường alert NGOÀI host hoạt động"
+            exit 0
+          fi
+          # up = có phản hồi HTTP 2xx/3xx/4xx (inbound + nginx sống); down = không kết nối/timeout/5xx
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$TARGET" || echo 000)"
+          case "$code" in 2*|3*|4*) up=1 ;; *) sleep 20
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$TARGET" || echo 000)"
+            case "$code" in 2*|3*|4*) up=1 ;; *) up=0 ;; esac ;; esac
+          prev="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/probe.yml/runs?status=completed&per_page=1" \
+                    --jq '.workflow_runs[0].conclusion' 2>/dev/null || echo unknown)"
+          echo "code=$code up=$up prev=$prev"
+          if [ "$up" = 1 ]; then
+            if [ "$prev" = "failure" ]; then
+              send "✅ [RECOVERY][EXTERNAL] [$(ts)] $TARGET đã truy cập được lại (nhìn từ GitHub Actions)"
+            fi
+            exit 0
+          fi
+          if [ "$prev" != "failure" ]; then
+            send "🔴 [ALERT][EXTERNAL] [$(ts)] $TARGET KHÔNG truy cập được từ bên ngoài (HTTP $code, 2 lần thử qua GitHub Actions). Nếu egress-watchdog trên host cũng im → nghi host/inbound chết hẳn." || true
+          fi
+          exit 1
